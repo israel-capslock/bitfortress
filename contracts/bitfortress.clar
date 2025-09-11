@@ -91,3 +91,98 @@
     premium-features: (list 5 bool),
   }
 )
+
+;; Private Helper Functions
+
+(define-private (calculate-tier-level (deposit-amount uint))
+  (if (>= deposit-amount u50000000) ;; 50 STX
+    {
+      tier: u4,
+      multiplier: u250,
+    } ;; Fortress Elite: 2.5x
+    (if (>= deposit-amount u20000000) ;; 20 STX
+      {
+        tier: u3,
+        multiplier: u200,
+      } ;; Fortress Guardian: 2x
+      (if (>= deposit-amount u5000000) ;; 5 STX
+        {
+          tier: u2,
+          multiplier: u150,
+        } ;; Fortress Builder: 1.5x
+        {
+          tier: u1,
+          multiplier: u100,
+        } ;; Fortress Basic: 1x
+      )
+    )
+  )
+)
+
+(define-private (calculate-time-bonus (lock-duration uint))
+  (if (>= lock-duration u17280)
+    u175 ;; 12 months: 1.75x
+    (if (>= lock-duration u8640)
+      u150 ;; 6 months: 1.5x
+      (if (>= lock-duration u4320)
+        u125 ;; 3 months: 1.25x
+        u100 ;; No lock: 1x
+      )
+    )
+  )
+)
+
+(define-private (compute-staking-rewards
+    (user principal)
+    (blocks-elapsed uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? StakingVaults user) u0))
+      (deposit-amount (get stx-deposited vault))
+      (base-rate (var-get base-yield-rate))
+      (tier-multiplier (get-tier-multiplier (get tier-level vault)))
+      (time-bonus (calculate-time-bonus (get lock-duration vault)))
+    )
+    ;; Calculate: (deposit * rate * tier-multiplier * time-bonus * blocks) / annual-blocks
+    (/
+      (* (* (* (* deposit-amount base-rate) tier-multiplier) time-bonus)
+        blocks-elapsed
+      )
+      u525600000
+    )
+  )
+)
+
+(define-private (get-tier-multiplier (tier uint))
+  (let ((tier-config (map-get? FortressTiers tier)))
+    (match tier-config
+      config
+      (get yield-multiplier config)
+      u100 ;; Default 1x multiplier
+    )
+  )
+)
+
+(define-private (validate-lock-duration (duration uint))
+  (or
+    (is-eq duration u0) ;; Flexible staking
+    (is-eq duration u4320) ;; 3 months
+    (is-eq duration u8640) ;; 6 months
+    (is-eq duration u17280) ;; 12 months
+  )
+)
+
+(define-private (validate-proposal-params
+    (title (string-utf8 128))
+    (desc (string-utf8 512))
+    (period uint)
+  )
+  (and
+    (>= (len title) u5)
+    (<= (len title) u128)
+    (>= (len desc) u20)
+    (<= (len desc) u512)
+    (>= period u100) ;; Minimum 100 blocks
+    (<= period u4320) ;; Maximum 3 days
+  )
+)
