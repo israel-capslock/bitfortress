@@ -186,3 +186,111 @@
     (<= period u4320) ;; Maximum 3 days
   )
 )
+
+;; Public Interface Functions
+
+(define-public (initialize-fortress-tiers)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+
+    ;; Basic Tier
+    (map-set FortressTiers u1 {
+      minimum-deposit: u1000000,
+      yield-multiplier: u100,
+      governance-weight: u100,
+      premium-features: (list true false false false false),
+    })
+
+    ;; Builder Tier
+    (map-set FortressTiers u2 {
+      minimum-deposit: u5000000,
+      yield-multiplier: u150,
+      governance-weight: u150,
+      premium-features: (list true true false false false),
+    })
+
+    ;; Guardian Tier
+    (map-set FortressTiers u3 {
+      minimum-deposit: u20000000,
+      yield-multiplier: u200,
+      governance-weight: u200,
+      premium-features: (list true true true false false),
+    })
+
+    ;; Elite Tier
+    (map-set FortressTiers u4 {
+      minimum-deposit: u50000000,
+      yield-multiplier: u250,
+      governance-weight: u300,
+      premium-features: (list true true true true true),
+    })
+
+    (ok true)
+  )
+)
+
+(define-public (stake-in-fortress
+    (amount uint)
+    (lock-duration uint)
+  )
+  (let (
+      (current-vault (default-to {
+        stx-deposited: u0,
+        fortress-tokens: u0,
+        tier-level: u1,
+        lock-duration: u0,
+        stake-timestamp: u0,
+        last-reward-claim: u0,
+        withdrawal-initiated: none,
+        accumulated-yield: u0,
+        governance-power: u0,
+      }
+        (map-get? StakingVaults tx-sender)
+      ))
+      (tier-info (calculate-tier-level amount))
+    )
+    ;; Validation checks
+    (asserts! (validate-lock-duration lock-duration) ERR-INVALID-PARAMS)
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (>= amount (var-get minimum-stake-amount)) ERR-BELOW-MINIMUM)
+
+    ;; Transfer STX to fortress vault
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    ;; Mint fortress tokens (1:1 ratio initially)
+    (try! (ft-mint? fortress-token amount tx-sender))
+
+    ;; Update user's fortress vault
+    (map-set StakingVaults tx-sender
+      (merge current-vault {
+        stx-deposited: (+ (get stx-deposited current-vault) amount),
+        fortress-tokens: (+ (get fortress-tokens current-vault) amount),
+        tier-level: (get tier tier-info),
+        lock-duration: lock-duration,
+        stake-timestamp: stacks-block-height,
+        last-reward-claim: stacks-block-height,
+        governance-power: (* amount (get tier tier-info)),
+      })
+    )
+
+    ;; Update protocol totals
+    (var-set total-stx-locked (+ (var-get total-stx-locked) amount))
+    (ok true)
+  )
+)
+
+(define-public (initiate-withdrawal (amount uint))
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-NO-POSITION))
+      (available-stx (get stx-deposited vault))
+    )
+    (asserts! (>= available-stx amount) ERR-INSUFFICIENT-STX)
+    (asserts! (is-none (get withdrawal-initiated vault)) ERR-COOLDOWN-ACTIVE)
+
+    ;; Start withdrawal cooldown
+    (map-set StakingVaults tx-sender
+      (merge vault { withdrawal-initiated: (some stacks-block-height) })
+    )
+    (ok true)
+  )
+)
