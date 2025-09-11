@@ -294,3 +294,105 @@
     (ok true)
   )
 )
+
+(define-public (complete-withdrawal)
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-NO-POSITION))
+      (withdrawal-start (unwrap! (get withdrawal-initiated vault) ERR-UNAUTHORIZED))
+      (withdrawal-amount (get stx-deposited vault))
+    )
+    (asserts!
+      (>= (- stacks-block-height withdrawal-start) (var-get withdrawal-cooldown))
+      ERR-COOLDOWN-ACTIVE
+    )
+
+    ;; Burn fortress tokens
+    (try! (ft-burn? fortress-token (get fortress-tokens vault) tx-sender))
+
+    ;; Return STX to user
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+
+    ;; Clear vault position
+    (map-delete StakingVaults tx-sender)
+
+    ;; Update protocol totals
+    (var-set total-stx-locked (- (var-get total-stx-locked) withdrawal-amount))
+    (ok true)
+  )
+)
+
+(define-public (claim-staking-rewards)
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-NO-POSITION))
+      (blocks-since-claim (- stacks-block-height (get last-reward-claim vault)))
+      (reward-amount (compute-staking-rewards tx-sender blocks-since-claim))
+    )
+    (asserts! (> reward-amount u0) ERR-INSUFFICIENT-BALANCE)
+
+    ;; Mint reward tokens
+    (try! (ft-mint? fortress-token reward-amount tx-sender))
+
+    ;; Update vault with latest claim info
+    (map-set StakingVaults tx-sender
+      (merge vault {
+        last-reward-claim: stacks-block-height,
+        accumulated-yield: (+ (get accumulated-yield vault) reward-amount),
+        fortress-tokens: (+ (get fortress-tokens vault) reward-amount),
+      })
+    )
+    (ok reward-amount)
+  )
+)
+
+(define-public (submit-governance-proposal
+    (title (string-utf8 128))
+    (description (string-utf8 512))
+    (voting-period uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-UNAUTHORIZED))
+      (proposal-id (+ (var-get active-proposals) u1))
+      (min-governance-power u10000000) ;; 10 STX governance power required
+    )
+    (asserts! (>= (get governance-power vault) min-governance-power)
+      ERR-UNAUTHORIZED
+    )
+    (asserts! (validate-proposal-params title description voting-period)
+      ERR-INVALID-PARAMS
+    )
+
+    (map-set Proposals { proposal-id: proposal-id } {
+      proposer: tx-sender,
+      title: title,
+      description: description,
+      voting-start: stacks-block-height,
+      voting-end: (+ stacks-block-height voting-period),
+      executed: false,
+      support-votes: u0,
+      oppose-votes: u0,
+      quorum-threshold: (/ (var-get total-stx-locked) u10), ;; 10% quorum
+    })
+
+    (var-set active-proposals proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (cast-governance-vote
+    (proposal-id uint)
+    (support bool)
+  )
+  (let (
+      (proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id })
+        ERR-INVALID-PARAMS
+      ))
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-UNAUTHORIZED))
+      (voting-power (get governance-power vault))
+    )
+    (asserts! (<= stacks-block-height (get voting-end proposal))
+      ERR-INVALID-PARAMS
+    )
+    (asserts!
+      (and (> proposal-id u0) (<= proposal-id (var-get active-proposals)))
+      ERR-INVALID-PARAMS
+    )
