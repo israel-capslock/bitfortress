@@ -396,3 +396,70 @@
       (and (> proposal-id u0) (<= proposal-id (var-get active-proposals)))
       ERR-INVALID-PARAMS
     )
+
+    (map-set Proposals { proposal-id: proposal-id }
+      (merge proposal {
+        support-votes: (if support
+          (+ (get support-votes proposal) voting-power)
+          (get support-votes proposal)
+        ),
+        oppose-votes: (if support
+          (get oppose-votes proposal)
+          (+ (get oppose-votes proposal) voting-power)
+        ),
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (emergency-fortress-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set fortress-mode true)
+    (var-set protocol-paused true)
+    (ok true)
+  )
+)
+
+(define-public (deactivate-fortress-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set fortress-mode false)
+    (var-set protocol-paused false)
+    (ok true)
+  )
+)
+
+;; Read-Only Query Functions
+
+(define-read-only (get-protocol-stats)
+  (ok {
+    total-stx-locked: (var-get total-stx-locked),
+    base-yield-rate: (var-get base-yield-rate),
+    fortress-mode: (var-get fortress-mode),
+    protocol-paused: (var-get protocol-paused),
+    active-proposals: (var-get active-proposals),
+  })
+)
+
+(define-read-only (get-user-vault (user principal))
+  (ok (map-get? StakingVaults user))
+)
+
+(define-read-only (get-proposal-details (proposal-id uint))
+  (ok (map-get? Proposals { proposal-id: proposal-id }))
+)
+
+(define-read-only (get-fortress-tier (tier-level uint))
+  (ok (map-get? FortressTiers tier-level))
+)
+
+(define-read-only (calculate-potential-rewards (user principal))
+  (match (map-get? StakingVaults user)
+    vault (let ((blocks-elapsed (- stacks-block-height (get last-reward-claim vault))))
+      (ok (compute-staking-rewards user blocks-elapsed))
+    )
+    (ok u0)
+  )
+)
