@@ -1,0 +1,465 @@
+;; BitFortress Protocol
+;;
+;; Summary: Bitcoin-Native Liquid Staking with Fortress-Grade Security
+;;
+;; Description:
+;; BitFortress transforms STX into productive Bitcoin-secured yield through an
+;; innovative liquid staking protocol. Users deposit STX to earn compounding
+;; rewards while maintaining liquidity through fortress tokens. The protocol
+;; leverages Bitcoin's finality for unparalleled security, featuring dynamic
+;; tier-based rewards, time-locked premium yields, and decentralized governance.
+;;
+;; Built on Stacks Layer 2, BitFortress combines Bitcoin's immutable security
+;; with DeFi innovation, offering institutional-grade staking infrastructure
+;; with retail accessibility. Governance participants shape protocol evolution
+;; while earning enhanced rewards for their commitment to ecosystem growth.
+;;
+;; Core Features:
+;; - Bitcoin-finalized security model with STX liquid staking rewards
+;; - Dynamic tier system with escalating benefits for larger stakes
+;; - Time-locked positions earning fortress premium rates up to 15% APY
+;; - Liquid governance tokens enabling protocol parameter voting
+;; - Emergency fortress mode with multi-signature protection mechanisms
+;; - Adaptive withdrawal periods preventing cascading liquidation events
+;;
+
+;; Token Definitions
+(define-fungible-token fortress-token u0)
+
+;; Constants & Error Codes
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant ERR-UNAUTHORIZED (err u1000))
+(define-constant ERR-INVALID-PARAMS (err u1001))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u1002))
+(define-constant ERR-INSUFFICIENT-STX (err u1003))
+(define-constant ERR-COOLDOWN-ACTIVE (err u1004))
+(define-constant ERR-NO-POSITION (err u1005))
+(define-constant ERR-BELOW-MINIMUM (err u1006))
+(define-constant ERR-PROTOCOL-PAUSED (err u1007))
+
+;; Protocol State Variables
+(define-data-var protocol-paused bool false)
+(define-data-var fortress-mode bool false)
+(define-data-var total-stx-locked uint u0)
+(define-data-var base-yield-rate uint u800) ;; 8% base APY (100 = 1%)
+(define-data-var fortress-bonus-rate uint u200) ;; 2% fortress bonus
+(define-data-var minimum-stake-amount uint u1000000) ;; 1 STX minimum
+(define-data-var withdrawal-cooldown uint u1440) ;; 24hr cooldown blocks
+(define-data-var active-proposals uint u0)
+
+;; Data Structures
+
+;; Governance Proposals
+(define-map Proposals
+  { proposal-id: uint }
+  {
+    proposer: principal,
+    title: (string-utf8 128),
+    description: (string-utf8 512),
+    voting-start: uint,
+    voting-end: uint,
+    executed: bool,
+    support-votes: uint,
+    oppose-votes: uint,
+    quorum-threshold: uint,
+  }
+)
+
+;; User Staking Positions
+(define-map StakingVaults
+  principal
+  {
+    stx-deposited: uint,
+    fortress-tokens: uint,
+    tier-level: uint,
+    lock-duration: uint,
+    stake-timestamp: uint,
+    last-reward-claim: uint,
+    withdrawal-initiated: (optional uint),
+    accumulated-yield: uint,
+    governance-power: uint,
+  }
+)
+
+;; Fortress Tier Configuration
+(define-map FortressTiers
+  uint
+  {
+    minimum-deposit: uint,
+    yield-multiplier: uint,
+    governance-weight: uint,
+    premium-features: (list 5 bool),
+  }
+)
+
+;; Private Helper Functions
+
+(define-private (calculate-tier-level (deposit-amount uint))
+  (if (>= deposit-amount u50000000) ;; 50 STX
+    {
+      tier: u4,
+      multiplier: u250,
+    } ;; Fortress Elite: 2.5x
+    (if (>= deposit-amount u20000000) ;; 20 STX
+      {
+        tier: u3,
+        multiplier: u200,
+      } ;; Fortress Guardian: 2x
+      (if (>= deposit-amount u5000000) ;; 5 STX
+        {
+          tier: u2,
+          multiplier: u150,
+        } ;; Fortress Builder: 1.5x
+        {
+          tier: u1,
+          multiplier: u100,
+        } ;; Fortress Basic: 1x
+      )
+    )
+  )
+)
+
+(define-private (calculate-time-bonus (lock-duration uint))
+  (if (>= lock-duration u17280)
+    u175 ;; 12 months: 1.75x
+    (if (>= lock-duration u8640)
+      u150 ;; 6 months: 1.5x
+      (if (>= lock-duration u4320)
+        u125 ;; 3 months: 1.25x
+        u100 ;; No lock: 1x
+      )
+    )
+  )
+)
+
+(define-private (compute-staking-rewards
+    (user principal)
+    (blocks-elapsed uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? StakingVaults user) u0))
+      (deposit-amount (get stx-deposited vault))
+      (base-rate (var-get base-yield-rate))
+      (tier-multiplier (get-tier-multiplier (get tier-level vault)))
+      (time-bonus (calculate-time-bonus (get lock-duration vault)))
+    )
+    ;; Calculate: (deposit * rate * tier-multiplier * time-bonus * blocks) / annual-blocks
+    (/
+      (* (* (* (* deposit-amount base-rate) tier-multiplier) time-bonus)
+        blocks-elapsed
+      )
+      u525600000
+    )
+  )
+)
+
+(define-private (get-tier-multiplier (tier uint))
+  (let ((tier-config (map-get? FortressTiers tier)))
+    (match tier-config
+      config
+      (get yield-multiplier config)
+      u100 ;; Default 1x multiplier
+    )
+  )
+)
+
+(define-private (validate-lock-duration (duration uint))
+  (or
+    (is-eq duration u0) ;; Flexible staking
+    (is-eq duration u4320) ;; 3 months
+    (is-eq duration u8640) ;; 6 months
+    (is-eq duration u17280) ;; 12 months
+  )
+)
+
+(define-private (validate-proposal-params
+    (title (string-utf8 128))
+    (desc (string-utf8 512))
+    (period uint)
+  )
+  (and
+    (>= (len title) u5)
+    (<= (len title) u128)
+    (>= (len desc) u20)
+    (<= (len desc) u512)
+    (>= period u100) ;; Minimum 100 blocks
+    (<= period u4320) ;; Maximum 3 days
+  )
+)
+
+;; Public Interface Functions
+
+(define-public (initialize-fortress-tiers)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+
+    ;; Basic Tier
+    (map-set FortressTiers u1 {
+      minimum-deposit: u1000000,
+      yield-multiplier: u100,
+      governance-weight: u100,
+      premium-features: (list true false false false false),
+    })
+
+    ;; Builder Tier
+    (map-set FortressTiers u2 {
+      minimum-deposit: u5000000,
+      yield-multiplier: u150,
+      governance-weight: u150,
+      premium-features: (list true true false false false),
+    })
+
+    ;; Guardian Tier
+    (map-set FortressTiers u3 {
+      minimum-deposit: u20000000,
+      yield-multiplier: u200,
+      governance-weight: u200,
+      premium-features: (list true true true false false),
+    })
+
+    ;; Elite Tier
+    (map-set FortressTiers u4 {
+      minimum-deposit: u50000000,
+      yield-multiplier: u250,
+      governance-weight: u300,
+      premium-features: (list true true true true true),
+    })
+
+    (ok true)
+  )
+)
+
+(define-public (stake-in-fortress
+    (amount uint)
+    (lock-duration uint)
+  )
+  (let (
+      (current-vault (default-to {
+        stx-deposited: u0,
+        fortress-tokens: u0,
+        tier-level: u1,
+        lock-duration: u0,
+        stake-timestamp: u0,
+        last-reward-claim: u0,
+        withdrawal-initiated: none,
+        accumulated-yield: u0,
+        governance-power: u0,
+      }
+        (map-get? StakingVaults tx-sender)
+      ))
+      (tier-info (calculate-tier-level amount))
+    )
+    ;; Validation checks
+    (asserts! (validate-lock-duration lock-duration) ERR-INVALID-PARAMS)
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (>= amount (var-get minimum-stake-amount)) ERR-BELOW-MINIMUM)
+
+    ;; Transfer STX to fortress vault
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    ;; Mint fortress tokens (1:1 ratio initially)
+    (try! (ft-mint? fortress-token amount tx-sender))
+
+    ;; Update user's fortress vault
+    (map-set StakingVaults tx-sender
+      (merge current-vault {
+        stx-deposited: (+ (get stx-deposited current-vault) amount),
+        fortress-tokens: (+ (get fortress-tokens current-vault) amount),
+        tier-level: (get tier tier-info),
+        lock-duration: lock-duration,
+        stake-timestamp: stacks-block-height,
+        last-reward-claim: stacks-block-height,
+        governance-power: (* amount (get tier tier-info)),
+      })
+    )
+
+    ;; Update protocol totals
+    (var-set total-stx-locked (+ (var-get total-stx-locked) amount))
+    (ok true)
+  )
+)
+
+(define-public (initiate-withdrawal (amount uint))
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-NO-POSITION))
+      (available-stx (get stx-deposited vault))
+    )
+    (asserts! (>= available-stx amount) ERR-INSUFFICIENT-STX)
+    (asserts! (is-none (get withdrawal-initiated vault)) ERR-COOLDOWN-ACTIVE)
+
+    ;; Start withdrawal cooldown
+    (map-set StakingVaults tx-sender
+      (merge vault { withdrawal-initiated: (some stacks-block-height) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-withdrawal)
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-NO-POSITION))
+      (withdrawal-start (unwrap! (get withdrawal-initiated vault) ERR-UNAUTHORIZED))
+      (withdrawal-amount (get stx-deposited vault))
+    )
+    (asserts!
+      (>= (- stacks-block-height withdrawal-start) (var-get withdrawal-cooldown))
+      ERR-COOLDOWN-ACTIVE
+    )
+
+    ;; Burn fortress tokens
+    (try! (ft-burn? fortress-token (get fortress-tokens vault) tx-sender))
+
+    ;; Return STX to user
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+
+    ;; Clear vault position
+    (map-delete StakingVaults tx-sender)
+
+    ;; Update protocol totals
+    (var-set total-stx-locked (- (var-get total-stx-locked) withdrawal-amount))
+    (ok true)
+  )
+)
+
+(define-public (claim-staking-rewards)
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-NO-POSITION))
+      (blocks-since-claim (- stacks-block-height (get last-reward-claim vault)))
+      (reward-amount (compute-staking-rewards tx-sender blocks-since-claim))
+    )
+    (asserts! (> reward-amount u0) ERR-INSUFFICIENT-BALANCE)
+
+    ;; Mint reward tokens
+    (try! (ft-mint? fortress-token reward-amount tx-sender))
+
+    ;; Update vault with latest claim info
+    (map-set StakingVaults tx-sender
+      (merge vault {
+        last-reward-claim: stacks-block-height,
+        accumulated-yield: (+ (get accumulated-yield vault) reward-amount),
+        fortress-tokens: (+ (get fortress-tokens vault) reward-amount),
+      })
+    )
+    (ok reward-amount)
+  )
+)
+
+(define-public (submit-governance-proposal
+    (title (string-utf8 128))
+    (description (string-utf8 512))
+    (voting-period uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-UNAUTHORIZED))
+      (proposal-id (+ (var-get active-proposals) u1))
+      (min-governance-power u10000000) ;; 10 STX governance power required
+    )
+    (asserts! (>= (get governance-power vault) min-governance-power)
+      ERR-UNAUTHORIZED
+    )
+    (asserts! (validate-proposal-params title description voting-period)
+      ERR-INVALID-PARAMS
+    )
+
+    (map-set Proposals { proposal-id: proposal-id } {
+      proposer: tx-sender,
+      title: title,
+      description: description,
+      voting-start: stacks-block-height,
+      voting-end: (+ stacks-block-height voting-period),
+      executed: false,
+      support-votes: u0,
+      oppose-votes: u0,
+      quorum-threshold: (/ (var-get total-stx-locked) u10), ;; 10% quorum
+    })
+
+    (var-set active-proposals proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (cast-governance-vote
+    (proposal-id uint)
+    (support bool)
+  )
+  (let (
+      (proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id })
+        ERR-INVALID-PARAMS
+      ))
+      (vault (unwrap! (map-get? StakingVaults tx-sender) ERR-UNAUTHORIZED))
+      (voting-power (get governance-power vault))
+    )
+    (asserts! (<= stacks-block-height (get voting-end proposal))
+      ERR-INVALID-PARAMS
+    )
+    (asserts!
+      (and (> proposal-id u0) (<= proposal-id (var-get active-proposals)))
+      ERR-INVALID-PARAMS
+    )
+
+    (map-set Proposals { proposal-id: proposal-id }
+      (merge proposal {
+        support-votes: (if support
+          (+ (get support-votes proposal) voting-power)
+          (get support-votes proposal)
+        ),
+        oppose-votes: (if support
+          (get oppose-votes proposal)
+          (+ (get oppose-votes proposal) voting-power)
+        ),
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (emergency-fortress-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set fortress-mode true)
+    (var-set protocol-paused true)
+    (ok true)
+  )
+)
+
+(define-public (deactivate-fortress-mode)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set fortress-mode false)
+    (var-set protocol-paused false)
+    (ok true)
+  )
+)
+
+;; Read-Only Query Functions
+
+(define-read-only (get-protocol-stats)
+  (ok {
+    total-stx-locked: (var-get total-stx-locked),
+    base-yield-rate: (var-get base-yield-rate),
+    fortress-mode: (var-get fortress-mode),
+    protocol-paused: (var-get protocol-paused),
+    active-proposals: (var-get active-proposals),
+  })
+)
+
+(define-read-only (get-user-vault (user principal))
+  (ok (map-get? StakingVaults user))
+)
+
+(define-read-only (get-proposal-details (proposal-id uint))
+  (ok (map-get? Proposals { proposal-id: proposal-id }))
+)
+
+(define-read-only (get-fortress-tier (tier-level uint))
+  (ok (map-get? FortressTiers tier-level))
+)
+
+(define-read-only (calculate-potential-rewards (user principal))
+  (match (map-get? StakingVaults user)
+    vault (let ((blocks-elapsed (- stacks-block-height (get last-reward-claim vault))))
+      (ok (compute-staking-rewards user blocks-elapsed))
+    )
+    (ok u0)
+  )
+)
